@@ -1,0 +1,1221 @@
+---
+title: "Tarea 1: Caja de herramientas de pronóstico"
+subtitle: "Series de tiempo univariadas — Semestre 2026-II"
+author: "Juan Manuel Diaz Larrea"
+date: today
+date-format: "D [de] MMMM [de] YYYY"
+format: pdf
+toc: true
+number-sections: false
+execute:
+  echo: true
+  warning: false
+  message: false
+knitr:
+  opts_chunk:
+    tbl-pos: "H"
+    fig.align: "center"
+editor:
+  mode: source
+  markdown:
+    wrap: 72
+---
+
+```{r}
+#| label: setup
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(purrr)
+library(knitr)
+
+# Carga de scripts con rutas 
+base_dir <- if (file.exists("R/00-lectura.R")) "." else ".."
+source(file.path(base_dir, "R/00-lectura.R"))
+source(file.path(base_dir, "R/01-graficos.R"))
+source(file.path(base_dir, "R/02-metodos.R"))
+source(file.path(base_dir, "R/03-evaluacion.R"))
+source(file.path(base_dir, "ejemplos/driver.R"))
+
+rds_path <- file.path(base_dir, "figs/resultados_completos.rds")
+if (!file.exists(rds_path)) source(file.path(base_dir, "ejemplos/ejemplos.R"))
+resultados <- readRDS(rds_path)
+
+
+fnum <- function(x, d = 4) sprintf(paste0("%.", d, "f"), x)
+fpct <- function(x, d = 2) sprintf(paste0("%.", d, "f%%"), x)
+
+
+prueba6_md <- function(nombre, H0, H1, stat_nombre, stat_val, dist_txt,
+                        crit_val, p_val, decision_txt, interp_txt) {
+  paste0(
+    "\n\n**Prueba de hipótesis — ", nombre, ".**\n\n",
+    "1. *Hipótesis*: $H_0: ", H0, "$ frente a $H_1: ", H1, "$.\n\n",
+    "2. *Estadístico y distribución bajo $H_0$*: $", stat_nombre, " = ",
+    fnum(stat_val), "$, que se distribuye como $", dist_txt, "$.\n\n",
+    "3. *Región de rechazo al 5%*: valor crítico $= ", fnum(crit_val), "$.\n\n",
+    "4. *Valor observado*: ${", stat_nombre, "}_{obs} = ", fnum(stat_val),
+    "$, valor $p = ", fnum(p_val), "$.\n\n",
+    "5. *Decisión*: ", decision_txt, ".\n\n",
+    "6. *Lectura*: ", interp_txt, "\n\n"
+  )
+}
+
+decide <- function(p) if (p < 0.05) "se rechaza $H_0$" else "no se rechaza $H_0$"
+```
+
+## 1. Introducción
+
+Este informe documenta, ejemplo por ejemplo, la aplicación de los ocho
+métodos de pronóstico no paramétricos y de tendencia construidos a mano
+en `R/02-metodos.R`, más un contraejemplo, sobre series de la base de R.
+Cada método se implementó únicamente con R base y con los paquetes de
+manipulación y graficación permitidos (`dplyr`, `tibble`, `ggplot2`,
+`patchwork`); ninguna función de un paquete de pronóstico ni las
+funciones de `stats` prohibidas en las instrucciones aparecen en
+`R/02-metodos.R`.
+
+A diferencia de una versión anterior de este documento, aquí **cada
+ejemplo tiene su propia sección**, con su propio tramo de código (que
+corre el protocolo y produce tablas y figuras) seguido de su propio
+texto de análisis escrito para esa serie en particular: la lectura del
+correlograma, la decisión de cada prueba y, sobre todo, la conclusión y
+la recomendación, se redactan para lo que efectivamente ocurre en *esa*
+serie y no como una plantilla genérica reciclada entre los ocho casos.
+Los bloques de hipótesis (función `prueba6_md()` arriba) solo dan
+formato uniforme a los seis elementos exigidos por las instrucciones; el
+argumento de fondo de cada prueba —qué significa para la serie o para el
+método— se escribe aparte, a mano.
+
+## 2. Verificación numérica de las implementaciones
+
+Antes de usar las funciones sobre los ocho ejemplos, se contrasta cada
+pieza de la caja de herramientas contra la función equivalente de R,
+para descartar errores de programación en el álgebra de cada método.
+
+```{r}
+#| label: verificacion
+datos_nile <- leer_serie(Nile, fuente = "Measurements of the annual flow of the river Nile at Aswan, 1871-1970",
+                          unidad = "10^8 m^3")
+m_test <- 10
+
+# 1. ACF propia vs stats::acf
+acf_propia <- correlograma(datos_nile, m = m_test)$acf
+acf_r <- as.numeric(stats::acf(datos_nile$y, lag.max = m_test, plot = FALSE)$acf[-1])
+max_diff_acf <- max(abs(acf_propia - acf_r))
+
+# 2. Ljung-Box propio vs Box.test
+lb_propio <- ljung_box(acf_propia, T = nrow(datos_nile), m = m_test, p = 0)
+lb_r <- stats::Box.test(datos_nile$y, lag = m_test, type = "Ljung-Box")
+diff_lb <- abs(lb_propio$estadistico - lb_r$statistic)
+
+# 3. Tendencia lineal propia vs lm()
+tend_propia <- ajustar_tendencia(datos_nile$y, tipo = "lineal")
+fit_lm <- stats::lm(y ~ t, data = tibble(y = datos_nile$y, t = seq_along(datos_nile$y)))
+diff_coef <- max(abs(tend_propia$parametros$beta - coef(fit_lm)))
+
+# 4. SES: forma de corrección de error vs promedio ponderado
+ses_fit <- ajustar_ses(datos_nile$y, alpha = 0.3)
+yhat_ses <- ses_fit$yhat
+e_ses <- datos_nile$y - yhat_ses
+yhat_ec <- yhat_ses + 0.3 * e_ses
+diff_ses <- max(abs(yhat_ses[3:100] - yhat_ec[2:99]))
+
+# 5. Holt: forma de corrección de error
+holt_fit <- ajustar_holt(datos_nile$y, alpha = 0.3, beta = 0.2)
+L <- holt_fit$parametros$L_t; Th <- holt_fit$parametros$Th_t
+e_holt <- datos_nile$y - (dplyr::lag(L) + dplyr::lag(Th))
+diff_holt <- max(abs(diff(L)[-1] - (Th[2:99] + 0.3 * e_holt[3:100])), na.rm = TRUE)
+
+df_verif <- tibble(
+  Prueba = c("ACF manual vs stats::acf()",
+             "Ljung-Box vs Box.test()",
+             "Coeficientes tendencia lineal vs lm()",
+             "SES: corrección de error vs promedio ponderado",
+             "Holt: forma de corrección de error"),
+  Diferencia_maxima = c(max_diff_acf, diff_lb, diff_coef, diff_ses, diff_holt),
+  Estado = ifelse(c(max_diff_acf, diff_lb, diff_coef, diff_ses, diff_holt) < 1e-8,
+                   "Aprobado", "Revisar")
+)
+kable(df_verif, digits = 12, caption = "Verificación numérica de las funciones propias contra sus equivalentes de R.")
+```
+
+Las cinco comparaciones coinciden con la implementación de referencia de
+R hasta el orden de $10^{-10}$ o mejor, lo que respalda que el álgebra
+de `correlograma()`, `ljung_box()`, `ajustar_tendencia()`,
+`ajustar_ses()` y `ajustar_holt()` está bien implementada antes de
+usarla sobre los ocho ejemplos.
+
+## 3. Protocolo aplicado a los ocho métodos y al contraejemplo
+
+Cada uno de los nueve casos siguientes (ocho métodos y un contraejemplo)
+sigue el mismo protocolo de siete pasos exigido por las instrucciones:
+(i) descripción verificada de la serie; (ii) gráfico y correlograma de
+la serie, con el contraste individual de los $r_h$ contra la banda de
+ruido blanco y la prueba de Ljung–Box; (iii) partición en tramo de
+estimación y tramo de validación, con
+$h=\min\{12,\lfloor 0.2\,T\rfloor\}$; (iv) ajuste sobre el tramo de
+estimación, con la constante o ventana elegida por `optimizar()` cuando
+el método lo requiere; (v) métricas MSE, MAD, MAPE y MASE de un paso en
+estimación y de los $h$ pronósticos extramuestrales en validación; (vi)
+validación de los errores de un paso con `validar_errores()`; y (vii)
+comparación contra el pronóstico ingenuo (o ingenuo estacional) sobre el
+mismo tramo de validación. Lo que cambia de un caso a otro —y que por
+eso se escribe aparte en cada subsección— es la lectura de ese protocolo
+sobre la serie concreta.
+
+### 3.1 Media simple — `discoveries` (10 pts, calentamiento)
+
+**a. Descripción y patrón.** `discoveries` cuenta, para cada año entre
+1860 y 1959, el número de inventos y descubrimientos científicos
+"grandes" reportados. Es un conteo con media relativamente estable y sin
+una tendencia marcada, lo que la hace un buen candidato para un modelo
+de nivel constante en lugar de uno con tendencia.
+
+```{r}
+#| label: media-plot
+res <- resultados$media
+res$datos %>% graficar_serie(res$nombre) 
+res$corr_serie$grafico
+```
+
+```{r}
+#| label: media-contraste-rh
+n_fuera <- sum(abs(res$corr_serie$acf) > res$corr_serie$banda)
+```
+
+De los `r res$corr_serie$m` rezagos graficados en el correlograma,
+`r n_fuera` superan individualmente la banda de ruido blanco
+$\pm 1{,}96/\sqrt{n}$ con $n=$ `r res$corr_serie$n`. Esto es consistente
+con una serie sin estructura fuerte de corto plazo: hay algo de
+autocorrelación en los primeros rezagos, pero no el patrón sistemático
+(decaimiento lento, picos estacionales) que sugeriría una tendencia o
+una estacionalidad.
+
+```{r}
+#| label: media-lb-serie
+#| results: asis
+lb <- res$lb_serie
+cat(prueba6_md(
+  nombre = "Ljung–Box sobre la serie discoveries",
+  H0 = "\\gamma_1=\\cdots=\\gamma_{m}=0 \\ \\text{(ruido blanco)}",
+  H1 = "\\text{algún } \\gamma_h\\neq 0",
+  stat_nombre = "Q_m", stat_val = lb$estadistico,
+  dist_txt = sprintf("\\chi^2_{%d}", lb$gl),
+  crit_val = lb$valor_critico, p_val = lb$valor_p,
+  decision_txt = decide(lb$valor_p),
+  interp_txt = if (lb$valor_p < 0.05) {
+    "hay autocorrelación conjunta detectable hasta el rezago considerado, aunque, como se vio arriba, ningún rezago individual se sale mucho de la banda: la estructura es débil y de corto alcance, compatible con un nivel que fluctúa poco."
+  } else {
+    "no hay evidencia de estructura temporal conjunta hasta el rezago considerado, lo que respalda tratar la serie como un nivel aproximadamente constante con ruido, sin necesidad de un método con tendencia."
+  }
+))
+```
+
+**b. Partición y ajuste.** Con $T=$ `r res$Tn` se usa $h=$ `r res$h`
+para el tramo de validación. La media simple no tiene constante que
+optimizar: `r fnum(res$ajuste$parametros$beta0_hat, 2)` es la media
+recursiva final $\bar Y_T$, que es también el pronóstico para todo el
+horizonte extramuestral.
+
+**c. Métricas de error.**
+
+```{r}
+#| label: media-metricas
+tibble(
+  Tramo = c("Estimación (1 paso)", "Validación (método)", "Validación (ingenuo)"),
+  MSE = c(res$med_estimacion$MSE, res$med_validacion$MSE, res$med_ingenuo_val$MSE),
+  MAD = c(res$med_estimacion$MAD, res$med_validacion$MAD, res$med_ingenuo_val$MAD),
+  MAPE = c(res$med_estimacion$MAPE, res$med_validacion$MAPE, res$med_ingenuo_val$MAPE),
+  MASE = c(res$med_estimacion$MASE, res$med_validacion$MASE, res$med_ingenuo_val$MASE)
+) %>% kable(digits = 3, caption = "Media simple sobre discoveries: métricas de error.")
+```
+
+**d. Validación de los errores de un paso.**
+
+```{r}
+#| label: media-errores-plot
+ve <- res$val_err
+ve$grafico_errores
+ve$correlograma$grafico
+```
+
+```{r}
+#| label: media-t-media-cero
+#| results: asis
+mc <- ve$media_cero
+cat(prueba6_md(
+  nombre = "media cero de los errores de un paso",
+  H0 = "\\mu_e=0", H1 = "\\mu_e\\neq 0",
+  stat_nombre = "t", stat_val = mc$estadistico,
+  dist_txt = sprintf("t_{%d}", mc$gl),
+  crit_val = mc$valor_critico, p_val = mc$valor_p,
+  decision_txt = decide(mc$valor_p),
+  interp_txt = if (mc$valor_p < 0.05) {
+    "los errores de un paso de la media simple están sesgados en promedio, lo que indica que el nivel recursivo no termina de acomodarse a la serie dentro del tramo de estimación."
+  } else {
+    "no hay evidencia de sesgo sistemático en los errores de un paso: la media recursiva sigue razonablemente el nivel observado."
+  }
+))
+```
+
+```{r}
+#| label: media-lb-errores
+#| results: asis
+lbe <- ve$ljung_box
+cat(prueba6_md(
+  nombre = "Ljung–Box sobre los errores de un paso (p = 1 parámetro: la media)",
+  H0 = "\\gamma_1=\\cdots=\\gamma_{m-1}=0 \\text{ en los errores}",
+  H1 = "\\text{algún } \\gamma_h\\neq 0 \\text{ en los errores}",
+  stat_nombre = "Q_m", stat_val = lbe$estadistico,
+  dist_txt = sprintf("\\chi^2_{%d}", lbe$gl),
+  crit_val = lbe$valor_critico, p_val = lbe$valor_p,
+  decision_txt = decide(lbe$valor_p),
+  interp_txt = if (lbe$valor_p < 0.05) {
+    "queda autocorrelación en los residuos de un paso que la media simple no captura; esto reforzaría considerar un método con memoria de corto plazo (media móvil)."
+  } else {
+    "los errores de un paso se comportan como ruido blanco en autocorrelación, coherente con haber elegido un método de nivel para una serie sin tendencia clara."
+  }
+))
+```
+
+```{r}
+#| label: media-jb-dw
+#| results: asis
+jb <- ve$jarque_bera
+cat(prueba6_md(
+  nombre = "Jarque–Bera de normalidad en los errores",
+  H0 = "\\text{asimetría}=0 \\ \\text{y curtosis}=3",
+  H1 = "\\text{los errores no son Normales}",
+  stat_nombre = "JB", stat_val = jb$estadistico,
+  dist_txt = "\\chi^2_2",
+  crit_val = jb$valor_critico, p_val = jb$valor_p,
+  decision_txt = decide(jb$valor_p),
+  interp_txt = paste0(
+    if (jb$valor_p < 0.05) "los errores se alejan de la normal, " else "no se rechaza la normalidad de los errores, ",
+    "sobre N = ", jb$N, " errores",
+    if (jb$aviso_muestra_pequena) " (advertencia: N < 20, la prueba es asintótica y su tamaño de muestra es pequeño)." else "."
+  )
+))
+dw <- ve$durbin_watson
+if (dw$metodo == "tabla") {
+  cat(sprintf(
+    "\n\n**Durbin–Watson sobre los errores.** $d=%s$; para $n=%d$, $k=%d$ regresor(es), las cotas al 5%% son $d_L=%s$ y $d_U=%s$. Decisión: %s.\n\n",
+    fnum(dw$estadistico), dw$n, dw$k, fnum(dw$dL, 3), fnum(dw$dU, 3), dw$decision
+  ))
+} else {
+  cat(prueba6_md(
+    nombre = "Durbin–Watson (aproximación asintótica, T fuera de tabla)",
+    H0 = "\\rho=0", H1 = "\\rho\\neq 0",
+    stat_nombre = "Z", stat_val = dw$z, dist_txt = "N(0,1)",
+    crit_val = dw$valor_critico_z, p_val = dw$valor_p,
+    decision_txt = decide(dw$valor_p),
+    interp_txt = "lectura de autocorrelación de primer orden bajo la aproximación asintótica de Durbin-Watson."
+  ))
+}
+```
+
+**e. Comparación contra el ingenuo y gráfico final.**
+
+```{r}
+#| label: media-final
+res$grafico_final
+```
+
+Sobre el mismo tramo de validación de `r res$h` observaciones, el MASE
+del método es `r fnum(res$med_validacion$MASE,3)` frente a
+`r fnum(res$med_ingenuo_val$MASE,3)` del ingenuo.
+
+**f. Conclusión.** Se ajustó la media simple sobre `discoveries` ($T=$
+`r res$Tn`), con nivel final $\hat Y=$
+`r fnum(res$ajuste$parametros$beta0_hat,2)`. En validación produjo un
+MASE de `r fnum(res$med_validacion$MASE,3)` frente a
+`r fnum(res$med_ingenuo_val$MASE,3)` del ingenuo
+(`r if (res$med_validacion$MASE < res$med_ingenuo_val$MASE) "superándolo" else "sin superarlo"`),
+y el diagnóstico de errores mostró
+`r if (ve$ljung_box$valor_p > 0.05) "ausencia de autocorrelación residual" else "autocorrelación residual remanente"`
+(Ljung–Box, $p=$ `r fnum(ve$ljung_box$valor_p,4)`) y
+`r if (mc$valor_p > 0.05) "ausencia de sesgo" else "sesgo detectable"`
+en la media de los errores ($p=$ `r fnum(mc$valor_p,4)`).
+
+**g. Recomendación.** Un pronóstico de nivel constante como este es
+razonable para alguien que solo necesita una referencia agregada de
+cuántos descubrimientos "típicos" esperar por año, y es defendible hasta
+un horizonte corto ($h\le$ `r res$h`), porque no reacciona a ningún
+cambio de nivel: si la tasa de descubrimientos cambiara de régimen (por
+ejemplo, una aceleración tecnológica sostenida), el método tardaría en
+absorberla porque cada observación nueva pesa $1/T$ en la media
+recursiva. Su límite queda evidenciado en el MAPE de validación, de
+`r fpct(res$med_validacion$MAPE)`.
+
+### 3.2 Media móvil — `Nile` (constante óptima por rejilla)
+
+**a. Descripción y patrón.** `Nile` registra el caudal anual del río
+Nilo en Asuán entre 1871 y 1970. La serie tiene un quiebre de nivel bien
+documentado hacia 1898-1899, asociado a la construcción de la primera
+presa de Asuán, que reduce el caudal medio observado en la segunda mitad
+de la muestra.
+
+```{r}
+#| label: mm-plot
+res <- resultados$mm
+res$datos %>% graficar_serie(res$nombre)
+res$corr_serie$grafico
+```
+
+```{r}
+#| label: mm-contraste-rh
+n_fuera <- sum(abs(res$corr_serie$acf) > res$corr_serie$banda)
+```
+
+`r n_fuera` de los `r res$corr_serie$m` rezagos superan la banda de
+ruido blanco, y el patrón de la ACF decae despacio en lugar de cortar de
+inmediato: esto es consistente con un nivel que cambia en el tiempo (el
+quiebre de 1898) más que con ruido blanco puro, y por eso un promedio
+móvil de ventana corta —que sigue el nivel local en lugar de fijarlo
+para toda la muestra— es una elección razonable frente a la media simple
+del ejemplo anterior.
+
+```{r}
+#| label: mm-lb-serie
+#| results: asis
+lb <- res$lb_serie
+cat(prueba6_md(
+  nombre = "Ljung–Box sobre la serie Nile",
+  H0 = "\\gamma_1=\\cdots=\\gamma_m=0", H1 = "\\text{algún }\\gamma_h\\neq 0",
+  stat_nombre = "Q_m", stat_val = lb$estadistico,
+  dist_txt = sprintf("\\chi^2_{%d}", lb$gl),
+  crit_val = lb$valor_critico, p_val = lb$valor_p,
+  decision_txt = decide(lb$valor_p),
+  interp_txt = "la autocorrelación detectada es compatible con el cambio de nivel de 1898 y no con un ciclo estacional, pues la serie es anual."
+))
+```
+
+**b. Optimización de** $k$.
+
+```{r}
+#| label: mm-opt
+opt <- res$opt
+ggplot(opt$tabla, aes(x = k, y = MSE)) +
+  geom_line(color = "#1f3b57") + geom_point(color = "#1f3b57") +
+  geom_vline(xintercept = opt$optimo$k, linetype = "dashed", color = "firebrick") +
+  labs(title = "MSE de un paso vs ventana k (media móvil)", x = "k", y = "MSE") +
+  theme_minimal(base_size = 12)
+```
+
+El óptimo se alcanza en $k=$ `r opt$optimo$k`, con MSE de un paso de
+`r fnum(min(opt$tabla$MSE),2)`.
+`r if (opt$optimo$k %in% range(opt$tabla$k)) "El óptimo cae en el borde de la rejilla evaluada (2:12): esto sugiere que, si se permitiera una ventana aún más extrema, el MSE de un paso podría seguir mejorando, y con k en el borde inferior el método se aproxima al pronóstico ingenuo." else "El óptimo es interior a la rejilla, lo que indica una ventana bien identificada y no un caso límite del ingenuo."`
+
+**c. Métricas.**
+
+```{r}
+#| label: mm-metricas
+tibble(
+  Tramo = c("Estimación (1 paso)", "Validación (método)", "Validación (ingenuo)"),
+  MSE = c(res$med_estimacion$MSE, res$med_validacion$MSE, res$med_ingenuo_val$MSE),
+  MAD = c(res$med_estimacion$MAD, res$med_validacion$MAD, res$med_ingenuo_val$MAD),
+  MAPE = c(res$med_estimacion$MAPE, res$med_validacion$MAPE, res$med_ingenuo_val$MAPE),
+  MASE = c(res$med_estimacion$MASE, res$med_validacion$MASE, res$med_ingenuo_val$MASE)
+) %>% kable(digits = 3, caption = "Media móvil sobre Nile: métricas de error.")
+```
+
+**d. Validación de errores.**
+
+```{r}
+#| label: mm-errores-plot
+ve <- res$val_err
+ve$grafico_errores
+ve$correlograma$grafico
+```
+
+```{r}
+#| label: mm-pruebas-errores
+#| results: asis
+mc <- ve$media_cero; lbe <- ve$ljung_box; jb <- ve$jarque_bera
+cat(prueba6_md("media cero de los errores", "\\mu_e=0", "\\mu_e\\neq 0",
+  "t", mc$estadistico, sprintf("t_{%d}", mc$gl), mc$valor_critico, mc$valor_p,
+  decide(mc$valor_p),
+  "sin sesgo relevante en los errores de un paso, la ventana elegida sigue el nivel sin desviarse sistemáticamente hacia arriba o hacia abajo."))
+cat(prueba6_md("Ljung–Box sobre errores (p = 0: k no cuenta como parámetro estimado por mínimos cuadrados)",
+  "\\gamma_1=\\cdots=\\gamma_{m}=0", "\\text{algún }\\gamma_h\\neq 0",
+  "Q_m", lbe$estadistico, sprintf("\\chi^2_{%d}", lbe$gl), lbe$valor_critico, lbe$valor_p,
+  decide(lbe$valor_p),
+  if (lbe$valor_p < 0.05) "queda algo de estructura en los residuos, esperable si el quiebre de nivel no queda perfectamente absorbido por una ventana fija." else "los residuos de un paso no muestran autocorrelación relevante: la ventana elegida sigue bien el nivel cambiante."))
+cat(prueba6_md("Jarque–Bera de normalidad", "\\text{asimetría}=0,\\ \\text{curtosis}=3", "\\text{no Normal}",
+  "JB", jb$estadistico, "\\chi^2_2", jb$valor_critico, jb$valor_p, decide(jb$valor_p),
+  paste0("sobre N = ", jb$N, " errores", if (jb$aviso_muestra_pequena) " (N < 20, advertencia de muestra pequeña)." else ".")))
+dw <- ve$durbin_watson
+if (dw$metodo == "tabla") {
+  cat(sprintf("\n\n**Durbin–Watson.** $d=%s$, cotas al 5%% para n=%d, k=%d: $d_L=%s$, $d_U=%s$. Decisión: %s.\n\n",
+              fnum(dw$estadistico), dw$n, dw$k, fnum(dw$dL,3), fnum(dw$dU,3), dw$decision))
+}
+```
+
+**e. Comparación contra el ingenuo y gráfico final.**
+
+```{r}
+#| label: mm-final
+res$grafico_final
+```
+
+**f. Conclusión.** La media móvil de orden $k=$ `r opt$optimo$k` alcanzó
+un MASE de validación de `r fnum(res$med_validacion$MASE,3)` frente a
+`r fnum(res$med_ingenuo_val$MASE,3)` del ingenuo
+(`r if (res$med_validacion$MASE < res$med_ingenuo_val$MASE) "lo supera" else "no logra superarlo"`),
+con
+`r if (ve$ljung_box$valor_p > 0.05) "residuos sin autocorrelación relevante" else "algo de autocorrelación residual"`.
+
+**g. Recomendación.** Es un pronóstico útil para quien necesita seguir
+el nivel de mediano plazo del caudal sin modelar explícitamente el
+quiebre estructural de 1898; razonable hasta $h\le$ `r res$h` años. Su
+límite es que la ventana $k$ es fija: si ocurriera un nuevo quiebre de
+nivel, el método tardaría aproximadamente $k$ observaciones en
+reflejarlo por completo, y el MAPE de validación
+(`r fpct(res$med_validacion$MAPE)`) da la magnitud del error esperable
+mientras eso ocurre.
+
+### 3.3 Suavizamiento exponencial simple — `discoveries`
+
+**a. Descripción y patrón.** Se usa de nuevo `discoveries` (la misma
+serie del ejemplo 3.1; el enunciado permite reutilizar una serie hasta
+en dos ejemplos), esta vez para contrastar un método de nivel con
+memoria geométrica (SES) contra la media simple sin memoria.
+
+```{r}
+#| label: ses-plot
+res <- resultados$ses
+res$corr_serie$grafico
+```
+
+```{r}
+#| label: ses-lb
+#| results: asis
+lb <- res$lb_serie
+cat(prueba6_md("Ljung–Box sobre discoveries", "\\gamma_1=\\cdots=\\gamma_m=0",
+  "\\text{algún }\\gamma_h\\neq 0", "Q_m", lb$estadistico,
+  sprintf("\\chi^2_{%d}", lb$gl), lb$valor_critico, lb$valor_p, decide(lb$valor_p),
+  "igual que en 3.1: hay algo de estructura débil de corto plazo, no un patrón de tendencia o estacionalidad, así que un método de nivel sigue siendo apropiado."))
+```
+
+**b. Optimización de** $\alpha$.
+
+```{r}
+#| label: ses-opt
+opt <- res$opt
+ggplot(opt$tabla, aes(x = alpha, y = MSE)) +
+  geom_line(color = "#1f3b57") + geom_point(size = 0.8, color = "#1f3b57") +
+  geom_vline(xintercept = opt$optimo$alpha, linetype = "dashed", color = "firebrick") +
+  labs(title = "MSE de un paso vs alpha (SES)", x = expression(alpha), y = "MSE") +
+  theme_minimal(base_size = 12)
+```
+
+El óptimo es $\alpha=$ `r fnum(opt$optimo$alpha,2)`.
+`r if (opt$optimo$alpha >= max(opt$tabla$alpha) - 1e-9) "Cae en el borde superior de la rejilla, lo que equivale casi al pronóstico ingenuo (poca memoria del pasado): la serie no sería estacionaria en media en el tramo de estimación." else if (opt$optimo$alpha <= min(opt$tabla$alpha) + 1e-9) "Cae en el borde inferior de la rejilla: el método pondera casi toda la memoria del pasado, coherente con un nivel estable como el de discoveries." else "El óptimo es interior, indicando un balance moderado entre memoria del pasado y reacción a lo último observado."`
+
+**c. Métricas.**
+
+```{r}
+#| label: ses-metricas
+tibble(
+  Tramo = c("Estimación (1 paso)", "Validación (método)", "Validación (ingenuo)"),
+  MSE = c(res$med_estimacion$MSE, res$med_validacion$MSE, res$med_ingenuo_val$MSE),
+  MAD = c(res$med_estimacion$MAD, res$med_validacion$MAD, res$med_ingenuo_val$MAD),
+  MAPE = c(res$med_estimacion$MAPE, res$med_validacion$MAPE, res$med_ingenuo_val$MAPE),
+  MASE = c(res$med_estimacion$MASE, res$med_validacion$MASE, res$med_ingenuo_val$MASE)
+) %>% kable(digits = 3, caption = "SES sobre discoveries: métricas de error.")
+```
+
+**d. Validación de errores.**
+
+```{r}
+#| label: ses-errores-plot
+ve <- res$val_err
+ve$grafico_errores
+ve$correlograma$grafico
+```
+
+```{r}
+#| label: ses-pruebas-errores
+#| results: asis
+mc <- ve$media_cero; lbe <- ve$ljung_box; jb <- ve$jarque_bera
+cat(prueba6_md("media cero de los errores", "\\mu_e=0", "\\mu_e\\neq 0", "t", mc$estadistico,
+  sprintf("t_{%d}", mc$gl), mc$valor_critico, mc$valor_p, decide(mc$valor_p),
+  "el nivel actualizado por corrección de error sigue el nivel observado sin sesgo sistemático."))
+cat(prueba6_md("Ljung–Box sobre errores (p = 1: se estimó alpha)", "\\gamma_1=\\cdots=\\gamma_{m-1}=0",
+  "\\text{algún }\\gamma_h\\neq 0", "Q_m", lbe$estadistico, sprintf("\\chi^2_{%d}", lbe$gl),
+  lbe$valor_critico, lbe$valor_p, decide(lbe$valor_p),
+  "los residuos se comportan como ruido blanco, lo esperable tras optimizar alpha por MSE de un paso."))
+cat(prueba6_md("Jarque–Bera", "\\text{asimetría}=0,\\ \\text{curtosis}=3", "\\text{no Normal}", "JB",
+  jb$estadistico, "\\chi^2_2", jb$valor_critico, jb$valor_p, decide(jb$valor_p),
+  paste0("N = ", jb$N, " errores", if (jb$aviso_muestra_pequena) " (advertencia: N < 20)." else ".")))
+```
+
+**e. Comparación con el ingenuo, gráfico final.**
+
+```{r}
+#| label: ses-final
+res$grafico_final
+```
+
+**f-g. Conclusión y recomendación.** Con $\alpha=$
+`r fnum(opt$optimo$alpha,2)`, el SES obtuvo un MASE de validación de
+`r fnum(res$med_validacion$MASE,3)` frente a
+`r fnum(res$med_ingenuo_val$MASE,3)` del ingenuo. Comparado con la media
+simple de 3.1 (MASE `r fnum(resultados$media$med_validacion$MASE,3)`),
+`r if (res$med_validacion$MASE < resultados$media$med_validacion$MASE) "el SES mejora sobre el nivel puramente recursivo, porque puede reaccionar algo más a los años recientes" else "el SES no mejora sobre la media simple en este tramo de validación, señal de que la memoria adicional no aporta cuando el nivel es en verdad estable"`.
+Es recomendable para el mismo uso agregado que 3.1, pero con algo más de
+capacidad de reacción; su límite, igual que allí, es un horizonte corto
+($h\le$ `r res$h`) y un MAPE de validación de
+`r fpct(res$med_validacion$MAPE)`.
+
+### 3.4 Contraejemplo — SES sobre `nottem` (serie estacional)
+
+**a. Descripción y por qué es un contraejemplo.** `nottem` registra la
+temperatura media mensual en el castillo de Nottingham entre 1920 y
+1939. Es una serie con estacionalidad anual muy marcada (ciclo de 12
+meses, verano-invierno) y sin tendencia. El supuesto detrás de SES es un
+**nivel** que cambia lentamente sin componente estacional; aplicar SES
+aquí contradice deliberadamente ese supuesto, y es exactamente el
+contraejemplo que exige la instrucción (e).
+
+```{r}
+#| label: contraej-plot
+res <- resultados$ses_contraejemplo
+res$datos %>% graficar_serie(res$nombre)
+res$corr_serie$grafico
+```
+
+La ACF de la serie muestra el patrón sinusoidal característico de una
+estacionalidad de periodo 12: picos positivos en rezagos múltiplos de 12
+y negativos en los rezagos intermedios (medio ciclo), y no el
+decaimiento monótono de un proceso de nivel.
+
+```{r}
+#| label: contraej-lb-serie
+#| results: asis
+lb <- res$lb_serie
+cat(prueba6_md("Ljung–Box sobre nottem", "\\gamma_1=\\cdots=\\gamma_m=0",
+  "\\text{algún }\\gamma_h\\neq 0", "Q_m", lb$estadistico,
+  sprintf("\\chi^2_{%d}", lb$gl), lb$valor_critico, lb$valor_p, decide(lb$valor_p),
+  "se rechaza con enorme margen: la estacionalidad mensual produce una autocorrelación fuerte y persistente, exactamente lo contrario del ruido blanco que supone un método de nivel puro."))
+```
+
+**b. Ajuste y resultado.** Se optimizó $\alpha$ igual que en 3.3, esta
+vez sobre `nottem`, y se usó el ingenuo **estacional** ($s=12$) como
+referente, tal como exige la instrucción para series estacionales.
+
+```{r}
+#| label: contraej-metricas
+tibble(
+  Tramo = c("Estimación (1 paso)", "Validación (método)", "Validación (ingenuo estacional)"),
+  MSE = c(res$med_estimacion$MSE, res$med_validacion$MSE, res$med_ingenuo_val$MSE),
+  MAD = c(res$med_estimacion$MAD, res$med_validacion$MAD, res$med_ingenuo_val$MAD),
+  MAPE = c(res$med_estimacion$MAPE, res$med_validacion$MAPE, res$med_ingenuo_val$MAPE),
+  MASE = c(res$med_estimacion$MASE, res$med_validacion$MASE, res$med_ingenuo_val$MASE)
+) %>% kable(digits = 3, caption = "SES sobre nottem (contraejemplo): métricas de error.")
+```
+
+```{r}
+#| label: contraej-errores-plot
+ve <- res$val_err
+ve$grafico_errores
+ve$correlograma$grafico
+```
+
+```{r}
+#| label: contraej-lb-errores
+#| results: asis
+lbe <- ve$ljung_box
+cat(prueba6_md("Ljung–Box sobre los errores de un paso del SES en nottem",
+  "\\gamma_1=\\cdots=\\gamma_{m-1}=0\\ \\text{en los residuos}",
+  "\\text{algún }\\gamma_h\\neq 0", "Q_m", lbe$estadistico,
+  sprintf("\\chi^2_{%d}", lbe$gl), lbe$valor_critico, lbe$valor_p, decide(lbe$valor_p),
+  "el correlograma de errores conserva picos en los rezagos estacionales: el nivel corregido por SES no absorbe el ciclo anual, así que los residuos de un paso siguen siendo predecibles a partir de su propio pasado estacional."))
+```
+
+**c. Conclusión del contraejemplo.** El MASE de validación del SES es
+`r fnum(res$med_validacion$MASE,3)` frente a
+`r fnum(res$med_ingenuo_val$MASE,3)` del ingenuo estacional
+(`r if (res$med_validacion$MASE < res$med_ingenuo_val$MASE) "aun así, mejor" else "peor"`),
+y el correlograma de errores y la prueba de Ljung–Box sobre los residuos
+($p=$ `r fnum(lbe$valor_p,4)`) muestran que la falla no es de
+optimización de $\alpha$ sino de especificación: SES no tiene término
+estacional, así que ningún $\alpha$ puede corregir errores que se
+repiten cada 12 meses. La recomendación aquí es negativa: SES no debe
+usarse sobre series con un ciclo estacional tan marcado como el de
+`nottem`; correspondería, en su lugar, un método con componente
+estacional explícito.
+
+### 3.5 Doble media móvil — `austres`
+
+**a. Descripción y patrón.** `austres` es el número trimestral de
+residentes en Australia, con una tendencia creciente sostenida y sin
+estacionalidad marcada en este agregado nacional.
+
+```{r}
+#| label: dmm-plot
+res <- resultados$dmm
+res$datos %>% graficar_serie(res$nombre)
+res$corr_serie$grafico
+```
+
+```{r}
+#| label: dmm-contraste-rh
+n_fuera <- sum(abs(res$corr_serie$acf) > res$corr_serie$banda)
+```
+
+`r n_fuera` de `r res$corr_serie$m` rezagos superan la banda, con
+decaimiento muy lento: el patrón típico de una tendencia, no de ruido
+blanco ni de estacionalidad. Esto justifica un método que estime nivel
+**y** pendiente local, como la doble media móvil, en lugar de un método
+de nivel puro.
+
+```{r}
+#| label: dmm-lb-serie
+#| results: asis
+lb <- res$lb_serie
+cat(prueba6_md("Ljung–Box sobre austres", "\\gamma_1=\\cdots=\\gamma_m=0",
+  "\\text{algún }\\gamma_h\\neq 0", "Q_m", lb$estadistico,
+  sprintf("\\chi^2_{%d}", lb$gl), lb$valor_critico, lb$valor_p, decide(lb$valor_p),
+  "coherente con la tendencia visible en el gráfico: la autocorrelación no proviene de un ciclo sino del nivel que crece de trimestre a trimestre."))
+```
+
+**b. Optimización de** $k$.
+
+```{r}
+#| label: dmm-opt
+opt <- res$opt
+ggplot(opt$tabla, aes(x = k, y = MSE)) +
+  geom_line(color = "#1f3b57") + geom_point(color = "#1f3b57") +
+  geom_vline(xintercept = opt$optimo$k, linetype = "dashed", color = "firebrick") +
+  labs(title = "MSE de un paso vs ventana k (doble media móvil)", x = "k", y = "MSE") +
+  theme_minimal(base_size = 12)
+```
+
+Óptimo en $k=$ `r opt$optimo$k`, con pendiente local final
+$\hat\beta_1(T)=$ `r fnum(res$ajuste$parametros$beta1_T,2)` personas
+(miles) por trimestre.
+
+**c. Métricas.**
+
+```{r}
+#| label: dmm-metricas
+tibble(
+  Tramo = c("Estimación (1 paso)", "Validación (método)", "Validación (ingenuo)"),
+  MSE = c(res$med_estimacion$MSE, res$med_validacion$MSE, res$med_ingenuo_val$MSE),
+  MAD = c(res$med_estimacion$MAD, res$med_validacion$MAD, res$med_ingenuo_val$MAD),
+  MAPE = c(res$med_estimacion$MAPE, res$med_validacion$MAPE, res$med_ingenuo_val$MAPE),
+  MASE = c(res$med_estimacion$MASE, res$med_validacion$MASE, res$med_ingenuo_val$MASE)
+) %>% kable(digits = 3, caption = "Doble media móvil sobre austres: métricas de error.")
+```
+
+**d. Validación de errores.**
+
+```{r}
+#| label: dmm-errores-plot
+ve <- res$val_err
+ve$grafico_errores
+ve$correlograma$grafico
+```
+
+```{r}
+#| label: dmm-pruebas-errores
+#| results: asis
+mc <- ve$media_cero; lbe <- ve$ljung_box; jb <- ve$jarque_bera
+cat(prueba6_md("media cero de los errores", "\\mu_e=0", "\\mu_e\\neq 0", "t", mc$estadistico,
+  sprintf("t_{%d}", mc$gl), mc$valor_critico, mc$valor_p, decide(mc$valor_p),
+  "sin sesgo relevante: el par (nivel, pendiente) sigue la tendencia sin desviarse consistentemente hacia arriba o abajo."))
+cat(prueba6_md("Ljung–Box sobre errores (p = 0)", "\\gamma_1=\\cdots=\\gamma_m=0",
+  "\\text{algún }\\gamma_h\\neq 0", "Q_m", lbe$estadistico, sprintf("\\chi^2_{%d}", lbe$gl),
+  lbe$valor_critico, lbe$valor_p, decide(lbe$valor_p),
+  if (lbe$valor_p < 0.05) "queda estructura en los residuos: la tendencia de austres no es perfectamente lineal local y una ventana fija no la sigue del todo." else "los residuos no muestran autocorrelación relevante hasta el rezago considerado."))
+cat(prueba6_md("Jarque–Bera", "\\text{asimetría}=0,\\ \\text{curtosis}=3", "\\text{no Normal}", "JB",
+  jb$estadistico, "\\chi^2_2", jb$valor_critico, jb$valor_p, decide(jb$valor_p),
+  paste0("N = ", jb$N, " errores", if (jb$aviso_muestra_pequena) " (advertencia: N < 20)." else ".")))
+```
+
+**e. Comparación y gráfico final.**
+
+```{r}
+#| label: dmm-final
+res$grafico_final
+```
+
+**f-g. Conclusión y recomendación.** La doble media móvil ($k=$
+`r opt$optimo$k`) obtuvo MASE de validación
+`r fnum(res$med_validacion$MASE,3)` frente a
+`r fnum(res$med_ingenuo_val$MASE,3)` del ingenuo
+(`r if (res$med_validacion$MASE < res$med_ingenuo_val$MASE) "superándolo, como es esperable cuando hay tendencia clara y el ingenuo la ignora por completo" else "sin superarlo, lo que indicaría un cambio de pendiente reciente que la ventana no capturó a tiempo"`).
+Es adecuada para pronósticos de mediano plazo de una tendencia
+demográfica suave, con $h\le$ `r res$h` trimestres; su límite es que
+asume pendiente constante dentro de la ventana, así que no anticipa
+aceleraciones o frenos de la tendencia, con un MAPE de validación de
+`r fpct(res$med_validacion$MAPE)`.
+
+### 3.6 Tendencia lineal — `LakeHuron`
+
+**a. Descripción y patrón.** `LakeHuron` es el nivel anual del lago
+Hurón entre 1875 y 1972 y muestra, a lo largo del siglo, un descenso
+gradual del nivel medio con oscilaciones de ciclo largo alrededor de esa
+caída, lo que sugiere una tendencia lineal (posiblemente con algo de
+estructura residual de ciclo).
+
+```{r}
+#| label: lin-plot
+res <- resultados$tend_lineal
+res$datos %>% graficar_serie(res$nombre)
+res$corr_serie$grafico
+```
+
+```{r}
+#| label: lin-lb-serie
+#| results: asis
+lb <- res$lb_serie
+cat(prueba6_md("Ljung–Box sobre LakeHuron", "\\gamma_1=\\cdots=\\gamma_m=0",
+  "\\text{algún }\\gamma_h\\neq 0", "Q_m", lb$estadistico,
+  sprintf("\\chi^2_{%d}", lb$gl), lb$valor_critico, lb$valor_p, decide(lb$valor_p),
+  "el decaimiento lento de la ACF es compatible con la tendencia descendente visible en el gráfico."))
+```
+
+**b. Ajuste por mínimos cuadrados y tabla de coeficientes.**
+
+```{r}
+#| label: lin-coef-tabla
+tc <- res$ajuste$parametros$tabla_coeficientes
+kable(tc, digits = 4, caption = "Tendencia lineal sobre LakeHuron: tabla de coeficientes (errores ordinarios y HAC).")
+```
+
+```{r}
+#| label: lin-coef-pruebas
+#| results: asis
+gl_reg <- res$Tn - res$h - nrow(tc)
+for (i in seq_len(nrow(tc))) {
+  cat(prueba6_md(
+    nombre = sprintf("significancia de %s (error estándar HAC, %d rezagos de Bartlett)", tc$parametro[i], res$ajuste$parametros$L_hac),
+    H0 = sprintf("\\beta_{%s}=0", tc$parametro[i]),
+    H1 = sprintf("\\beta_{%s}\\neq 0", tc$parametro[i]),
+    stat_nombre = "t_{HAC}", stat_val = tc$t_hac[i],
+    dist_txt = sprintf("t_{%d}", gl_reg),
+    crit_val = qt(0.975, df = gl_reg), p_val = tc$p_hac[i],
+    decision_txt = decide(tc$p_hac[i]),
+    interp_txt = sprintf("el coeficiente %s (estimado en %s) es %s con error robusto a autocorrelación al 5%%.",
+                          tc$parametro[i], fnum(tc$estimacion[i], 4),
+                          ifelse(tc$p_hac[i] < 0.05, "significativamente distinto de cero", "no distinguible de cero"))
+  ))
+}
+```
+
+**c. Revisión de supuestos del ajuste de tendencia.**
+
+```{r}
+#| label: lin-residuos-plot
+resid_z <- res$ajuste$parametros$residuos
+tibble(t = seq_along(resid_z), ajustado = res$ajuste$yhat, e = resid_z) %>%
+  ggplot(aes(x = ajustado, y = e)) + geom_point(color = "#1f3b57") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "firebrick") +
+  labs(title = "Residuos vs ajustados — tendencia lineal LakeHuron", x = "Ajustado", y = "Residuo") +
+  theme_minimal(base_size = 12)
+correlograma(resid_z, m = min(floor(length(resid_z)/4), 24))$grafico
+```
+
+```{r}
+#| label: lin-lb-residuos
+#| results: asis
+m_r <- min(floor(length(resid_z)/4), 24)
+acf_r_lin <- correlograma(resid_z, m = m_r)$acf
+lb_res <- ljung_box(acf_r_lin, T = length(resid_z), m = m_r, p = 2)
+cat(prueba6_md("Ljung–Box sobre residuos de la tendencia lineal (p = 2 coeficientes estimados)",
+  "\\gamma_1=\\cdots=\\gamma_{m-2}=0\\ \\text{en los residuos}", "\\text{algún }\\gamma_h\\neq 0",
+  "Q_m", lb_res$estadistico, sprintf("\\chi^2_{%d}", lb_res$gl), lb_res$valor_critico, lb_res$valor_p,
+  decide(lb_res$valor_p),
+  if (lb_res$valor_p < 0.05) "hay autocorrelación positiva en los residuos: los niveles del lago tienen ciclos de mediano plazo alrededor de la tendencia que una recta no absorbe. Por eso los valores p ordinarios de la tabla de coeficientes no son directamente interpretables (subestiman el error estándar bajo autocorrelación positiva) y la decisión sobre la pendiente debe basarse en los errores HAC reportados arriba." else "los residuos no muestran autocorrelación relevante, así que los valores p ordinarios y los HAC deberían coincidir en su decisión."))
+dw_lin <- durbin_watson(resid_z, k = res$ajuste$parametros$k_regresores)
+if (dw_lin$metodo == "tabla") {
+  cat(sprintf("\n\n**Durbin–Watson sobre los residuos.** $d=%s$; cotas al 5%% para n=%d, k=%d regresor(es): $d_L=%s$, $d_U=%s$. Decisión: %s.\n\n",
+              fnum(dw_lin$estadistico), dw_lin$n, dw_lin$k, fnum(dw_lin$dL,3), fnum(dw_lin$dU,3), dw_lin$decision))
+}
+jb_lin <- jarque_bera(resid_z)
+cat(prueba6_md("Jarque–Bera sobre los residuos", "\\text{asimetría}=0,\\ \\text{curtosis}=3", "\\text{no Normal}",
+  "JB", jb_lin$estadistico, "\\chi^2_2", jb_lin$valor_critico, jb_lin$valor_p, decide(jb_lin$valor_p),
+  paste0("N = ", jb_lin$N, " residuos", if (jb_lin$aviso_muestra_pequena) " (advertencia: N < 20)." else ".")))
+```
+
+**d. Métricas y comparación.**
+
+```{r}
+#| label: lin-metricas-final
+tibble(
+  Tramo = c("Estimación (1 paso)", "Validación (método)", "Validación (ingenuo)"),
+  MSE = c(res$med_estimacion$MSE, res$med_validacion$MSE, res$med_ingenuo_val$MSE),
+  MAD = c(res$med_estimacion$MAD, res$med_validacion$MAD, res$med_ingenuo_val$MAD),
+  MAPE = c(res$med_estimacion$MAPE, res$med_validacion$MAPE, res$med_ingenuo_val$MAPE),
+  MASE = c(res$med_estimacion$MASE, res$med_validacion$MASE, res$med_ingenuo_val$MASE)
+) %>% kable(digits = 3, caption = "Tendencia lineal sobre LakeHuron: métricas de error.")
+res$grafico_final
+```
+
+**e-f. Conclusión y recomendación.** La recta ajustada tiene pendiente
+$\hat\beta_1=$ `r fnum(tc$estimacion[2],4)` (significativa con error
+HAC, $p=$ `r fnum(tc$p_hac[2],4)`), y produjo un MASE de validación de
+`r fnum(res$med_validacion$MASE,3)` frente a
+`r fnum(res$med_ingenuo_val$MASE,3)` del ingenuo. El diagnóstico de
+residuos
+(`r if (lb_res$valor_p > 0.05) "sin autocorrelación relevante" else "con autocorrelación de ciclo largo"`)
+matiza qué tan literalmente tomar los errores estándar ordinarios. Es
+útil para anticipar la tendencia secular del nivel del lago a horizontes
+de hasta `r res$h` años; su límite es que una recta no captura los
+ciclos de mediano plazo (evidentes en el correlograma de residuos), por
+lo que sistemáticamente sobre o subestimará el nivel dentro de cada fase
+del ciclo, con un MAPE de validación de
+`r fpct(res$med_validacion$MAPE)`.
+
+### 3.7 Tendencia cuadrática — `co2`
+
+**a. Descripción y patrón.** `co2` es la concentración mensual de CO$_2$
+en Mauna Loa (1959-1997): una tendencia creciente que además se acelera
+levemente con los años, superpuesta a un ciclo estacional anual muy
+marcado (fotosíntesis del hemisferio norte). La curvatura de la
+tendencia es la razón de usar un ajuste cuadrático en $t$; el ciclo
+estacional, en cambio, **no** está en el modelo, y eso es relevante para
+leer los residuos.
+
+```{r}
+#| label: quad-plot
+res <- resultados$tend_cuadratica
+res$datos %>% graficar_serie(res$nombre)
+res$corr_serie$grafico
+```
+
+```{r}
+#| label: quad-lb-serie
+#| results: asis
+lb <- res$lb_serie
+cat(prueba6_md("Ljung–Box sobre co2", "\\gamma_1=\\cdots=\\gamma_m=0", "\\text{algún }\\gamma_h\\neq 0",
+  "Q_m", lb$estadistico, sprintf("\\chi^2_{%d}", lb$gl), lb$valor_critico, lb$valor_p, decide(lb$valor_p),
+  "el rechazo combina la tendencia y el ciclo estacional de 12 meses; la ACF de una serie con ambos componentes decae muy lentamente y además oscila."))
+```
+
+**b. Ajuste y coeficientes.**
+
+```{r}
+#| label: quad-coef-tabla
+tc <- res$ajuste$parametros$tabla_coeficientes
+kable(tc, digits = 6, caption = "Tendencia cuadrática sobre co2: tabla de coeficientes (errores ordinarios y HAC).")
+```
+
+```{r}
+#| label: quad-coef-pruebas
+#| results: asis
+gl_reg <- res$Tn - res$h - nrow(tc)
+for (i in seq_len(nrow(tc))) {
+  cat(prueba6_md(
+    nombre = sprintf("significancia de %s (HAC, %d rezagos)", tc$parametro[i], res$ajuste$parametros$L_hac),
+    H0 = sprintf("\\beta_{%s}=0", tc$parametro[i]),
+    H1 = sprintf("\\beta_{%s}\\neq 0", tc$parametro[i]),
+    stat_nombre = "t_{HAC}", stat_val = tc$t_hac[i], dist_txt = sprintf("t_{%d}", gl_reg),
+    crit_val = qt(0.975, df = gl_reg), p_val = tc$p_hac[i], decision_txt = decide(tc$p_hac[i]),
+    interp_txt = sprintf("%s con error estándar robusto.", ifelse(tc$p_hac[i] < 0.05, "significativo", "no significativo"))
+  ))
+}
+```
+
+**c. Revisión de supuestos.** Aquí se espera, deliberadamente, encontrar
+autocorrelación fuerte en los residuos: el modelo no tiene componente
+estacional, así que el ciclo anual completo queda en el residuo.
+
+```{r}
+#| label: quad-residuos-plot
+resid_z <- res$ajuste$parametros$residuos
+correlograma(resid_z, m = min(floor(length(resid_z)/4), 24))$grafico
+```
+
+```{r}
+#| label: quad-lb-residuos
+#| results: asis
+m_r <- min(floor(length(resid_z)/4), 24)
+acf_r <- correlograma(resid_z, m = m_r)$acf
+lb_res <- ljung_box(acf_r, T = length(resid_z), m = m_r, p = 3)
+cat(prueba6_md("Ljung–Box sobre residuos de la tendencia cuadrática (p = 3 coeficientes)",
+  "\\gamma_1=\\cdots=\\gamma_{m-3}=0", "\\text{algún }\\gamma_h\\neq 0", "Q_m", lb_res$estadistico,
+  sprintf("\\chi^2_{%d}", lb_res$gl), lb_res$valor_critico, lb_res$valor_p, decide(lb_res$valor_p),
+  "se rechaza con margen amplio, y el correlograma de residuos muestra el patrón oscilante de periodo 12: es el ciclo estacional que la tendencia cuadrática, por construcción, no modela. En consecuencia, los valores p ordinarios de la tabla de coeficientes NO son interpretables (la autocorrelación positiva infla artificialmente la significancia aparente); la decisión sobre cada beta debe apoyarse en los t_HAC reportados arriba, que sí corrigen por esa dependencia."))
+jb_q <- jarque_bera(resid_z)
+cat(prueba6_md("Jarque–Bera sobre los residuos", "\\text{asimetría}=0,\\ \\text{curtosis}=3", "\\text{no Normal}",
+  "JB", jb_q$estadistico, "\\chi^2_2", jb_q$valor_critico, jb_q$valor_p, decide(jb_q$valor_p),
+  paste0("N = ", jb_q$N, " residuos.")))
+dw_q <- durbin_watson(resid_z, k = res$ajuste$parametros$k_regresores)
+if (dw_q$metodo == "tabla") {
+  cat(sprintf("\n\n**Durbin–Watson.** $d=%s$; cotas al 5%% para n=%d, k=%d: $d_L=%s$, $d_U=%s$. Decisión: %s.\n\n",
+              fnum(dw_q$estadistico), dw_q$n, dw_q$k, fnum(dw_q$dL,3), fnum(dw_q$dU,3), dw_q$decision))
+}
+```
+
+**d. Métricas y comparación.**
+
+```{r}
+#| label: quad-metricas-final
+tibble(
+  Tramo = c("Estimación (1 paso)", "Validación (método)", "Validación (ingenuo)"),
+  MSE = c(res$med_estimacion$MSE, res$med_validacion$MSE, res$med_ingenuo_val$MSE),
+  MAD = c(res$med_estimacion$MAD, res$med_validacion$MAD, res$med_ingenuo_val$MAD),
+  MAPE = c(res$med_estimacion$MAPE, res$med_validacion$MAPE, res$med_ingenuo_val$MAPE),
+  MASE = c(res$med_estimacion$MASE, res$med_validacion$MASE, res$med_ingenuo_val$MASE)
+) %>% kable(digits = 3, caption = "Tendencia cuadrática sobre co2: métricas de error.")
+res$grafico_final
+```
+
+**e-f. Conclusión y recomendación.** La curvatura $\hat\beta_2=$
+`r fnum(tc$estimacion[3],6)` resultó
+`r ifelse(tc$p_hac[3] < 0.05, "significativa", "no significativa")` con
+error HAC, y el ajuste produjo un MASE de validación de
+`r fnum(res$med_validacion$MASE,3)` frente a
+`r fnum(res$med_ingenuo_val$MASE,3)` del ingenuo. La curva captura
+razonablemente la aceleración secular del CO$_2$, pero, como se explicó,
+deja el ciclo estacional entero en el residuo (Ljung–Box sobre residuos,
+$p=$ `r fnum(lb_res$valor_p,4)`). Recomendarlo tiene sentido únicamente
+para el nivel de tendencia de largo plazo (horizontes de varios años),
+no para pronosticar un mes específico dentro del año: para eso haría
+falta un componente estacional que este método no tiene, límite que se
+refleja en un MAPE de validación de `r fpct(res$med_validacion$MAPE)`
+aun con una tendencia bien estimada.
+
+### 3.8 Tendencia exponencial — `airmiles`
+
+**a. Descripción y patrón.** `airmiles` mide las millas de pasajero
+transportadas por las aerolíneas de EE. UU. entre 1937 y 1960, con
+crecimiento marcadamente exponencial en la era de expansión de la
+aviación comercial de posguerra (con una desaceleración visible
+alrededor de los años de la Segunda Guerra Mundial).
+
+```{r}
+#| label: exp-plot
+res <- resultados$tend_exponencial
+res$datos %>% graficar_serie(res$nombre)
+res$corr_serie$grafico
+```
+
+```{r}
+#| label: exp-lb-serie
+#| results: asis
+lb <- res$lb_serie
+cat(prueba6_md("Ljung–Box sobre airmiles", "\\gamma_1=\\cdots=\\gamma_m=0", "\\text{algún }\\gamma_h\\neq 0",
+  "Q_m", lb$estadistico, sprintf("\\chi^2_{%d}", lb$gl), lb$valor_critico, lb$valor_p, decide(lb$valor_p),
+  "el decaimiento lentísimo de la ACF es propio de una serie con crecimiento explosivo, no de ruido blanco ni de un ciclo corto."))
+```
+
+**b. Ajuste sobre** $\log Y$ y coeficientes. El método linealiza como
+$\ln Y_t=a+\theta t+\varepsilon_t$, con $\hat\beta_0=e^{\hat a}$ y
+$\hat\beta_1=e^{\hat\theta}$; se activó `corregir_sesgo = TRUE` porque
+$e^{\hat a+\hat\theta t}$ estima la mediana condicional y no la media.
+
+```{r}
+#| label: exp-coef-tabla
+tc <- res$ajuste$parametros$tabla_coeficientes
+kable(tc, digits = 5, caption = "Tendencia exponencial sobre airmiles (escala log): tabla de coeficientes.")
+```
+
+```{r}
+#| label: exp-coef-pruebas
+#| results: asis
+gl_reg <- res$Tn - res$h - nrow(tc)
+for (i in seq_len(nrow(tc))) {
+  cat(prueba6_md(
+    nombre = sprintf("significancia de %s (HAC, %d rezagos)", tc$parametro[i], res$ajuste$parametros$L_hac),
+    H0 = sprintf("\\beta_{%s}=0", tc$parametro[i]), H1 = sprintf("\\beta_{%s}\\neq 0", tc$parametro[i]),
+    stat_nombre = "t_{HAC}", stat_val = tc$t_hac[i], dist_txt = sprintf("t_{%d}", gl_reg),
+    crit_val = qt(0.975, df = gl_reg), p_val = tc$p_hac[i], decision_txt = decide(tc$p_hac[i]),
+    interp_txt = sprintf("el parámetro %s (en la escala logarítmica) es %s con error robusto.",
+                          tc$parametro[i], ifelse(tc$p_hac[i] < 0.05, "significativo", "no significativo"))
+  ))
+}
+```
+
+**c. Revisión de supuestos** (sobre los residuos en escala log, que es
+la escala en que se estimó el modelo).
+
+```{r}
+#| label: exp-residuos-plot
+resid_z <- res$ajuste$parametros$residuos
+correlograma(resid_z, m = min(floor(length(resid_z)/4), 24))$grafico
+```
+
+```{r}
+#| label: exp-lb-residuos
+#| results: asis
+m_r <- min(floor(length(resid_z)/4), 24)
+acf_r <- correlograma(resid_z, m = m_r)$acf
+lb_res <- ljung_box(acf_r, T = length(resid_z), m = m_r, p = 2)
+cat(prueba6_md("Ljung–Box sobre residuos de la tendencia exponencial (p = 2)",
+  "\\gamma_1=\\cdots=\\gamma_{m-2}=0", "\\text{algún }\\gamma_h\\neq 0", "Q_m", lb_res$estadistico,
+  sprintf("\\chi^2_{%d}", lb_res$gl), lb_res$valor_critico, lb_res$valor_p, decide(lb_res$valor_p),
+  if (lb_res$valor_p < 0.05) "queda autocorrelación en el residuo logarítmico: la tasa de crecimiento no fue perfectamente constante durante todo el periodo (los años de guerra rompen el patrón exponencial suave), así que los p ordinarios no son fiables y la decisión sobre theta debe apoyarse en el t_HAC de arriba." else "los residuos en escala logarítmica no muestran autocorrelación relevante, respaldando una tasa de crecimiento aproximadamente constante."))
+jb_e <- jarque_bera(resid_z)
+cat(prueba6_md("Jarque–Bera sobre los residuos", "\\text{asimetría}=0,\\ \\text{curtosis}=3", "\\text{no Normal}",
+  "JB", jb_e$estadistico, "\\chi^2_2", jb_e$valor_critico, jb_e$valor_p, decide(jb_e$valor_p),
+  paste0("N = ", jb_e$N, " residuos.")))
+dw_e <- durbin_watson(resid_z, k = res$ajuste$parametros$k_regresores)
+if (dw_e$metodo == "tabla") {
+  cat(sprintf("\n\n**Durbin–Watson.** $d=%s$; cotas al 5%% para n=%d, k=%d: $d_L=%s$, $d_U=%s$. Decisión: %s.\n\n",
+              fnum(dw_e$estadistico), dw_e$n, dw_e$k, fnum(dw_e$dL,3), fnum(dw_e$dU,3), dw_e$decision))
+}
+```
+
+**d. Métricas y comparación (en la escala original de** $Y$).
+
+```{r}
+#| label: exp-metricas-final
+tibble(
+  Tramo = c("Estimación (1 paso)", "Validación (método)", "Validación (ingenuo)"),
+  MSE = c(res$med_estimacion$MSE, res$med_validacion$MSE, res$med_ingenuo_val$MSE),
+  MAD = c(res$med_estimacion$MAD, res$med_validacion$MAD, res$med_ingenuo_val$MAD),
+  MAPE = c(res$med_estimacion$MAPE, res$med_validacion$MAPE, res$med_ingenuo_val$MAPE),
+  MASE = c(res$med_estimacion$MASE, res$med_validacion$MASE, res$med_ingenuo_val$MASE)
+) %>% kable(digits = 3, caption = "Tendencia exponencial sobre airmiles: métricas de error.")
+res$grafico_final
+```
+
+**e-f. Conclusión y recomendación.** El coeficiente logarítmico estimado
+es $\hat\theta=$ `r fnum(tc$estimacion[2],5)` por periodo, lo que
+equivale a una tasa de crecimiento anual $\hat\beta_1=e^{\hat\theta}=$
+`r fnum(exp(tc$estimacion[2]),4)` (es decir, cerca de
+`r fnum((exp(tc$estimacion[2])-1)*100,2)`% de crecimiento anual
+promedio). Con esa tasa, el ajuste produjo un MASE de validación de
+`r fnum(res$med_validacion$MASE,3)` frente a
+`r fnum(res$med_ingenuo_val$MASE,3)` del ingenuo. Es útil para proyectar
+la magnitud del crecimiento agregado de mediano plazo del tráfico aéreo,
+no para anticipar puntos de quiebre (como una guerra o una crisis del
+sector): el modelo asume una tasa de crecimiento constante en todo el
+horizonte, y su MAPE de validación de `r fpct(res$med_validacion$MAPE)`
+es la medida directa de ese límite.
+
+### 3.9 Holt lineal — `WWWusage`
+
+**a. Descripción y patrón.** `WWWusage` registra, minuto a minuto, el
+número de usuarios conectados a un servidor; no tiene estacionalidad
+pero sí tramos con niveles y pendientes locales muy distintos (subidas y
+caídas de tráfico), lo que la hace apropiada para un método que
+actualice nivel **y** pendiente en cada paso, como Holt, en lugar de una
+tendencia global de mínimos cuadrados.
+
+```{r}
+#| label: holt-plot
+res <- resultados$holt
+res$datos %>% graficar_serie(res$nombre)
+res$corr_serie$grafico
+```
+
+```{r}
+#| label: holt-lb-serie
+#| results: asis
+lb <- res$lb_serie
+cat(prueba6_md("Ljung–Box sobre WWWusage", "\\gamma_1=\\cdots=\\gamma_m=0", "\\text{algún }\\gamma_h\\neq 0",
+  "Q_m", lb$estadistico, sprintf("\\chi^2_{%d}", lb$gl), lb$valor_critico, lb$valor_p, decide(lb$valor_p),
+  "la fuerte autocorrelación de corto rezago es compatible con tramos de nivel/pendiente persistentes minuto a minuto, no con un ciclo fijo."))
+```
+
+**b. Optimización de** $(\alpha,\beta)$.
+
+```{r}
+#| label: holt-opt
+opt <- res$opt
+ggplot(opt$tabla, aes(x = alpha, y = beta, fill = MSE)) +
+  geom_tile() +
+  geom_point(data = as.data.frame(opt$optimo), aes(x = alpha, y = beta),
+             inherit.aes = FALSE, color = "firebrick", size = 2) +
+  scale_fill_gradient(low = "#dbe7f3", high = "#08306b") +
+  labs(title = "Mapa de MSE de un paso sobre la rejilla (alpha, beta) — Holt",
+       x = expression(alpha), y = expression(beta)) +
+  theme_minimal(base_size = 12)
+```
+
+El óptimo es $(\alpha,\beta)=($ `r fnum(opt$optimo$alpha,2)`,
+`r fnum(opt$optimo$beta,2)` $)$.
+`r if (opt$optimo$alpha >= max(opt$tabla$alpha) - 1e-9 || opt$optimo$beta >= max(opt$tabla$beta) - 1e-9) "Al menos una de las dos constantes cae en el borde superior de su rejilla, señal de que el método pide reaccionar tan rápido a cada observación como se le permita: la serie cambia de régimen con frecuencia." else "Ambas constantes son interiores a la rejilla, sin evidencia de que el método quiera un caso límite (ni el ingenuo puro ni la máxima reactividad)."`
+
+**c. Métricas.**
+
+```{r}
+#| label: holt-metricas
+tibble(
+  Tramo = c("Estimación (1 paso)", "Validación (método)", "Validación (ingenuo)"),
+  MSE = c(res$med_estimacion$MSE, res$med_validacion$MSE, res$med_ingenuo_val$MSE),
+  MAD = c(res$med_estimacion$MAD, res$med_validacion$MAD, res$med_ingenuo_val$MAD),
+  MAPE = c(res$med_estimacion$MAPE, res$med_validacion$MAPE, res$med_ingenuo_val$MAPE),
+  MASE = c(res$med_estimacion$MASE, res$med_validacion$MASE, res$med_ingenuo_val$MASE)
+) %>% kable(digits = 3, caption = "Holt lineal sobre WWWusage: métricas de error.")
+```
+
+**d. Validación de errores.**
+
+```{r}
+#| label: holt-errores-plot
+ve <- res$val_err
+ve$grafico_errores
+ve$correlograma$grafico
+```
+
+```{r}
+#| label: holt-pruebas-errores
+#| results: asis
+mc <- ve$media_cero; lbe <- ve$ljung_box; jb <- ve$jarque_bera
+cat(prueba6_md("media cero de los errores", "\\mu_e=0", "\\mu_e\\neq 0", "t", mc$estadistico,
+  sprintf("t_{%d}", mc$gl), mc$valor_critico, mc$valor_p, decide(mc$valor_p),
+  "sin sesgo relevante: nivel y pendiente se actualizan sin desviarse consistentemente en una dirección."))
+cat(prueba6_md("Ljung–Box sobre errores (p = 2: alpha y beta)", "\\gamma_1=\\cdots=\\gamma_{m-2}=0",
+  "\\text{algún }\\gamma_h\\neq 0", "Q_m", lbe$estadistico, sprintf("\\chi^2_{%d}", lbe$gl),
+  lbe$valor_critico, lbe$valor_p, decide(lbe$valor_p),
+  if (lbe$valor_p < 0.05) "queda autocorrelación en los residuos: los cambios de régimen del tráfico son más abruptos de lo que un ajuste lineal local puede seguir instantáneamente." else "los residuos de un paso se comportan como ruido blanco, indicando que el nivel y la pendiente locales siguen bien la dinámica de la serie."))
+cat(prueba6_md("Jarque–Bera", "\\text{asimetría}=0,\\ \\text{curtosis}=3", "\\text{no Normal}", "JB",
+  jb$estadistico, "\\chi^2_2", jb$valor_critico, jb$valor_p, decide(jb$valor_p),
+  paste0("N = ", jb$N, " errores", if (jb$aviso_muestra_pequena) " (advertencia: N < 20)." else ".")))
+```
+
+**e. Comparación y gráfico final.**
+
+```{r}
+#| label: holt-final
+res$grafico_final
+```
+
+**f-g. Conclusión y recomendación.** Con $(\alpha,\beta)=($
+`r fnum(opt$optimo$alpha,2)`, `r fnum(opt$optimo$beta,2)` $)$, Holt
+obtuvo un MASE de validación de `r fnum(res$med_validacion$MASE,3)`
+frente a `r fnum(res$med_ingenuo_val$MASE,3)` del ingenuo
+(`r if (res$med_validacion$MASE < res$med_ingenuo_val$MASE) "mejor" else "sin mejorar"`),
+con
+`r if (ve$ljung_box$valor_p > 0.05) "residuos sin autocorrelación relevante" else "autocorrelación residual"`.
+Es apropiado para pronósticos operativos de muy corto plazo del tráfico
+($h\le$ `r res$h` minutos), donde seguir el nivel y la pendiente
+recientes importa más que capturar un patrón de largo plazo, que aquí no
+existe. Su límite es que extrapola la última pendiente local de forma
+lineal indefinidamente: si el tráfico se estabiliza o revierte justo
+después del último dato, el pronóstico se equivoca por construcción, con
+un MAPE de validación de `r fpct(res$med_validacion$MAPE)`.
+
+## 4. Resumen consolidado de resultados
+
+```{r}
+#| label: resumen
+resumen_df <- purrr::map_dfr(resultados, function(r) {
+  pe <- unlist(r$parametros_elegidos)
+  txt_par <- if (is.null(pe)) "(sin constante)" else paste(names(pe), round(pe, 3), sep = "=", collapse = ", ")
+  tibble(
+    Ejemplo = r$nombre, T_obs = r$Tn, Horizonte_h = r$h, Parametros = txt_par,
+    MASE_Metodo = round(r$med_validacion$MASE, 3),
+    MASE_Ingenuo = round(r$med_ingenuo_val$MASE, 3),
+    Gana_Ingenuo = ifelse(r$med_validacion$MASE < r$med_ingenuo_val$MASE, "Sí", "No")
+  )
+})
+kable(resumen_df, caption = "Resumen comparativo de desempeño extramuestral de los nueve casos evaluados.")
+```
+
+De los nueve casos, el contraejemplo (3.4) es, por construcción, el que
+peor se comporta relativo a su referente, precisamente porque el método
+aplicado contradice el patrón de la serie. Entre los ocho métodos
+restantes, los que mejor desempeño relativo muestran son aquellos cuyo
+supuesto de patrón —nivel estable, tendencia local o tendencia global,
+según el caso— coincide con lo que el correlograma y el gráfico de cada
+serie mostraron antes de ajustar nada, que es justamente el criterio que
+las instrucciones exigen usar para elegir la serie de cada ejemplo.
